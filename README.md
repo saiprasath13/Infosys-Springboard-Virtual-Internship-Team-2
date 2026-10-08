@@ -7,7 +7,7 @@
 | Team Lead | Saiprasath S |
 | Team Member | Aathini |
 | Team Member | Abdul Ruksar |
-| Team Member | Stenyyay |
+| Team Member | Steny Thankkam Raju |
 | Team Member | Namrata Gaikwad |
 
 Total Strength: 5 Members
