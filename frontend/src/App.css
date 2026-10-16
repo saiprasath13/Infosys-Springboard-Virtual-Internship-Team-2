@@ -312,10 +312,12 @@ select:focus-visible {
   line-height: 1.6;
 }
 
+
 .agent-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 18px;
+  align-items: stretch;
 }
 
 .agent-card {
@@ -325,6 +327,15 @@ select:focus-visible {
   border-radius: 17px;
   background: var(--surface);
   box-shadow: 0 4px 16px rgb(32 37 31 / 2%);
+
+  display: flex;
+  flex-direction: column;
+}
+
+.personality-control {
+  margin-top: auto;
+  padding-top: 19px;
+  border-top: 1px solid #edf0e9;
 }
 
 .agent-heading {
@@ -388,27 +399,47 @@ select:focus-visible {
   letter-spacing: 1.2px;
 }
 
+/* Soft green rounded highlight for goals and constraints */
 .detail-block p,
-.detail-block li {
-  color: #454c42;
-  font-size: 13px;
-  line-height: 1.8;
-  overflow-wrap: anywhere;
+.detail-block ul {
+  background: #e8f0e5;
+  border-radius: 14px;
+  padding: 12px 14px;
 }
 
-.detail-block p {
-  margin: 0;
+/* Keep constraint bullets properly aligned */
+.detail-block ul {
+  padding-left: 30px;
+}
+
+/* Give the green sections some breathing room */
+.detail-block p,
+.detail-block ul {
+  line-height: 1.8;
 }
 
 .detail-block ul {
-  display: grid;
-  gap: 6px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   margin: 0;
-  padding-left: 19px;
+  padding: 12px 14px;
+  text-align: left;
+}
+
+.detail-block li {
+  padding: 0;
+  text-align: left;
+}
+
+.detail-block li::before {
+  content: none;
+  display: none;
 }
 
 .personality-control {
-  margin-top: 22px;
+  margin-top: auto;
   padding-top: 19px;
   border-top: 1px solid #edf0e9;
 }
@@ -605,11 +636,20 @@ select:focus-visible {
 
 .negotiation-result {
   margin-top: 24px;
+   
+}
+
+
+.negotiation-result .result-summary {
+  width: fit-content;
+  margin-inline: auto;
+  text-align: left;
 }
 
 .negotiation-result > .eyebrow {
   display: inline-block;
   margin-bottom: 10px;
+   text-align: left;
 }
 
 .negotiation-result h4 {
@@ -617,16 +657,31 @@ select:focus-visible {
   color: var(--text);
   font-family: 'Manrope', sans-serif;
   font-size: 16px;
+
+}
+.final-allocations {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  width: 100%;
+  align-items: stretch;
 }
 
+.final-allocations .transcript-entry {
+  min-width: 0;
+  height: 100%;
+}
 .transcript {
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
   margin-top: 16px;
+  align-items: stretch;
 }
 
 .transcript-entry {
   min-width: 0;
+  height: 100%;
   padding: 16px;
   border: 1px solid #dfe7dc;
   border-radius: 12px;
@@ -685,6 +740,7 @@ footer {
 
 /* Responsive layout */
 
+
 @media (max-width: 900px) {
   .app {
     padding: 24px 20px;
@@ -701,6 +757,9 @@ footer {
   .review-panel {
     align-items: flex-start;
     flex-direction: column;
+  }
+  .transcript {
+    grid-template-columns: 1fr;
   }
 
   .start-button {

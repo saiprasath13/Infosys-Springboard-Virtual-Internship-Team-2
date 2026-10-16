@@ -395,7 +395,7 @@ function App() {
                   ? 'Agreement reached!'
                   : 'Negotiation ended'}
               </h3>
-
+                    <div className="result-summary">
               <p>
                 <strong>Scenario:</strong> {result.scenarioName}
               </p>
@@ -421,6 +421,13 @@ function App() {
                     <strong>Remaining budget:</strong>{' '}
                     ₹{formatAmount(remainingBudget)} lakh
                   </p>
+                    <p>
+                <strong>Engine:</strong> {result.engine}
+              </p>
+
+              <p>
+                <strong>Negotiation turns:</strong> {result.turnsUsed}
+              </p>
 
                   {budgetDetails?.allocationsLakh && (
                     <>
@@ -464,14 +471,8 @@ function App() {
                 </p>
               )}
 
-              <p>
-                <strong>Engine:</strong> {result.engine}
-              </p>
-
-              <p>
-                <strong>Negotiation turns:</strong> {result.turnsUsed}
-              </p>
-
+             
+</div>
               <h4>Negotiation transcript</h4>
 
               <div className="transcript">
