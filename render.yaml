@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: negotiation-arena
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ENVIRONMENT
+        value: production
+      - key: USE_SQLITE_FALLBACK
+        value: "false"
+      - key: USE_MOCK_AGENTS
+        value: "true"
