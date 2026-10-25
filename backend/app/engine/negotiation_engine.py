@@ -1,103 +1,48 @@
-from __future__ import annotations
-
-import asyncio
-import logging
-import math
-from datetime import datetime, timezone
-from typing import Optional
-
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.core.config import settings
-from app.db.session import AsyncSessionLocal
-from app.db.models import (
-    Negotiation,
-    NegotiationMessage,
-    Offer,
-    NegotiationStatus,
-    MessageRole,
-    OfferStatus,
-)
-from app.engine.scenarios import VendorPricingRules, get_scenario_rules
-from app.agents.mock_agent import MockAgent
-from app.agents.groq_agent import GroqAgent
-
-logger = logging.getLogger(__name__)
-
-
-def _get_agent(personality: str, role: str):
-    if settings.USE_MOCK_AGENTS or not settings.GROQ_API_KEY:
-        return MockAgent(personality=personality, role=role)
-    return GroqAgent(personality=personality, role=role)
-
-
-class NegotiationEngine:
-    """Orchestrates a single simulation or practice negotiation."""
-
-    def __init__(self, negotiation_id: int, db: AsyncSession):
-        self.negotiation_id = negotiation_id
-        self.db = db
-
-    @classmethod
-    async def run_simulation(cls, negotiation_id: int):
-        """Entry point for background simulation task."""
-        async with AsyncSessionLocal() as db:
-            engine = cls(negotiation_id, db)
-            await engine._run_simulation_loop()
-
-    async def _load_negotiation(self) -> Optional[Negotiation]:
-        result = await self.db.execute(
-            select(Negotiation)
-            .where(Negotiation.id == self.negotiation_id)
-            .execution_options(populate_existing=True)
-        )
-        return result.scalar_one_or_none()
-
-    async def _stop_for_validation_error(
-        self, neg: Negotiation, message: str
-    ):
-        """Stop immediately and persist the validation error."""
-        neg.status = NegotiationStatus.DEADLOCKED
-        neg.completed_at = datetime.now(timezone.utc)
-        neg.outcome_data = {
-            "final_outcome": "Negotiation stopped",
-            "validation_error": message,
-        }
-
-        await self.db.flush()
-        await self._add_message(
-            MessageRole.SYSTEM,
-            f"Negotiation stopped: {message}",
-        )
-        await self.db.commit()
-
-        logger.warning(
-            "Negotiation %s stopped: %s",
-            self.negotiation_id,
-            message,
-        )
 
     async def _run_simulation_loop(self):
         neg = await self._load_negotiation()
         if not neg:
-            logger.error("Negotiation %s not found", self.negotiation_id)
+            logger.error(
+                "Negotiation %s not found",
+                self.negotiation_id,
+            )
+            return
+
+        # Never restart a negotiation that has already ended.
+        if neg.status in (
+            NegotiationStatus.PAUSED,
+            NegotiationStatus.CANCELLED,
+            NegotiationStatus.DEADLOCKED,
+            NegotiationStatus.COMPLETED,
+        ):
+            logger.info(
+                "Negotiation %s is already stopped (status=%s)",
+                self.negotiation_id,
+                neg.status,
+            )
             return
 
         config = neg.config or {}
 
-        # Validate scenario configuration before starting any rounds.
+        # Validate all scenario constraints BEFORE creating agents,
+        # writing the "Negotiation started" message, or running rounds.
         try:
-            rules = get_scenario_rules(neg.scenario_type, config)
-        except (ValueError, TypeError) as exc:
+            rules = get_scenario_rules(
+                neg.scenario_type,
+                config,
+            )
+        except (ValueError, TypeError, OverflowError) as exc:
             await self._stop_for_validation_error(neg, str(exc))
             return
 
+        # Agent creation happens only after configuration is valid.
         agent_a = _get_agent(
-            config.get("agent_a_personality", "collaborative"), "agent_a"
+            config.get("agent_a_personality", "collaborative"),
+            "agent_a",
         )
         agent_b = _get_agent(
-            config.get("agent_b_personality", "aggressive"), "agent_b"
+            config.get("agent_b_personality", "aggressive"),
+            "agent_b",
         )
 
         await self._add_message(
@@ -110,6 +55,8 @@ class NegotiationEngine:
         offer_history = []
 
         for round_num in range(1, neg.max_rounds + 1):
+            # Reload from the database so a pause/cancel/stop request
+            # made while the simulation is running is observed.
             neg = await self._load_negotiation()
             if not neg:
                 return
@@ -127,28 +74,43 @@ class NegotiationEngine:
                 )
                 return
 
+            # Revalidate configuration before every round. This also
+            # prevents further execution if stored constraints changed.
+            try:
+                rules = get_scenario_rules(
+                    neg.scenario_type,
+                    neg.config or {},
+                )
+            except (ValueError, TypeError, OverflowError) as exc:
+                await self._stop_for_validation_error(neg, str(exc))
+                return
+
             neg.current_round = round_num
             await self.db.flush()
 
             # Agent A proposes.
-            a_offer, a_message = await agent_a.generate_offer(
-                round_num=round_num,
-                scenario_rules=rules,
-                offer_history=offer_history,
-                opponent_name=config.get("agent_b_name", "Party B"),
-            )
-
             try:
+                a_offer, a_message = await agent_a.generate_offer(
+                    round_num=round_num,
+                    scenario_rules=rules,
+                    offer_history=offer_history,
+                    opponent_name=config.get("agent_b_name", "Party B"),
+                )
                 a_offer = rules.clamp_offer("agent_a", a_offer)
-            except (ValueError, TypeError, AttributeError) as exc:
+            except (ValueError, TypeError, AttributeError, OverflowError) as exc:
                 await self._stop_for_validation_error(neg, str(exc))
                 return
 
             await self._add_message(
-                MessageRole.AGENT_A, a_message, round_num
+                MessageRole.AGENT_A,
+                a_message,
+                round_num,
             )
             offer_record_a = await self._add_offer(
-                round_num, "agent_a", a_offer, a_message
+                round_num,
+                "agent_a",
+                a_offer,
+                a_message,
             )
             offer_history.append(
                 {"round": round_num, "by": "agent_a", "offer": a_offer}
@@ -157,51 +119,66 @@ class NegotiationEngine:
 
             await asyncio.sleep(0.5)
 
-            # Agent B evaluates Agent A's offer.
-            b_decision, b_counter, b_message = await agent_b.evaluate_offer(
-                round_num=round_num,
-                opponent_offer=a_offer,
-                scenario_rules=rules,
-                offer_history=offer_history,
-                opponent_name=config.get("agent_a_name", "Party A"),
-            )
-
-            if (
-                b_decision == "accept"
-                and not rules.is_offer_acceptable("agent_b", a_offer)
+            # Check whether the simulation was stopped during the delay.
+            neg = await self._load_negotiation()
+            if not neg or neg.status in (
+                NegotiationStatus.PAUSED,
+                NegotiationStatus.CANCELLED,
+                NegotiationStatus.DEADLOCKED,
+                NegotiationStatus.COMPLETED,
             ):
-                b_decision = "counter"
-                b_counter = rules.clamp_offer("agent_b", a_offer)
-                prefix = "[MOCK] " if isinstance(agent_b, MockAgent) else ""
-                b_message = (
-                    f"{prefix}The offer is outside my acceptable limits. "
-                    "Here is my counter-offer."
+                return
+
+            # Agent B evaluates Agent A's offer.
+            try:
+                b_decision, b_counter, b_message = await agent_b.evaluate_offer(
+                    round_num=round_num,
+                    opponent_offer=a_offer,
+                    scenario_rules=rules,
+                    offer_history=offer_history,
+                    opponent_name=config.get("agent_a_name", "Party A"),
                 )
 
-            if b_decision == "accept":
-                # Final safety check before completing an agreement.
-                if not self._valid_final_offer(rules, a_offer):
-                    await self._stop_for_validation_error(
+                if (
+                    b_decision == "accept"
+                    and not rules.is_offer_acceptable("agent_b", a_offer)
+                ):
+                    b_decision = "counter"
+                    b_counter = rules.clamp_offer("agent_b", a_offer)
+                    prefix = "[MOCK] " if isinstance(agent_b, MockAgent) else ""
+                    b_message = (
+                        f"{prefix}The offer is outside my acceptable limits. "
+                        "Here is my counter-offer."
+                    )
+
+                if b_decision == "accept":
+                    if not self._valid_final_offer(rules, a_offer):
+                        await self._stop_for_validation_error(
+                            neg,
+                            "Final offer violates the negotiation price limits.",
+                        )
+                        return
+
+                    await self._add_message(
+                        MessageRole.AGENT_B,
+                        b_message,
+                        round_num,
+                    )
+                    offer_record_a.status = OfferStatus.ACCEPTED
+                    await self._complete_negotiation(
                         neg,
-                        "Final offer violates the negotiation price limits.",
+                        rules,
+                        a_offer,
+                        offer_history,
                     )
                     return
 
-                await self._add_message(
-                    MessageRole.AGENT_B, b_message, round_num
-                )
-                offer_record_a.status = OfferStatus.ACCEPTED
-                await self._complete_negotiation(
-                    neg, rules, a_offer, offer_history
-                )
-                return
-
-            # Agent B counter-offer.
-            try:
                 b_counter = rules.clamp_offer(
-                    "agent_b", b_counter or a_offer
+                    "agent_b",
+                    b_counter or a_offer,
                 )
-            except (ValueError, TypeError, AttributeError) as exc:
+
+            except (ValueError, TypeError, AttributeError, OverflowError) as exc:
                 await self._stop_for_validation_error(neg, str(exc))
                 return
 
@@ -212,10 +189,15 @@ class NegotiationEngine:
             )
 
             await self._add_message(
-                MessageRole.AGENT_B, b_message, round_num
+                MessageRole.AGENT_B,
+                b_message,
+                round_num,
             )
             offer_record_b = await self._add_offer(
-                round_num, "agent_b", b_counter, b_message
+                round_num,
+                "agent_b",
+                b_counter,
+                b_message,
             )
             offer_history.append(
                 {"round": round_num, "by": "agent_b", "offer": b_counter}
@@ -224,46 +206,67 @@ class NegotiationEngine:
 
             await asyncio.sleep(0.5)
 
-            # Agent A evaluates Agent B's counter-offer.
-            a_decision, _, a_response = await agent_a.evaluate_offer(
-                round_num=round_num,
-                opponent_offer=b_counter,
-                scenario_rules=rules,
-                offer_history=offer_history,
-                opponent_name=config.get("agent_b_name", "Party B"),
-            )
-
-            if (
-                a_decision == "accept"
-                and not rules.is_offer_acceptable("agent_a", b_counter)
+            # Stop before Agent A is called if the negotiation ended.
+            neg = await self._load_negotiation()
+            if not neg or neg.status in (
+                NegotiationStatus.PAUSED,
+                NegotiationStatus.CANCELLED,
+                NegotiationStatus.DEADLOCKED,
+                NegotiationStatus.COMPLETED,
             ):
-                a_decision = "counter"
-                prefix = "[MOCK] " if isinstance(agent_a, MockAgent) else ""
-                a_response = (
-                    f"{prefix}The offer is outside my acceptable limits. "
-                    "I cannot accept these terms."
+                return
+
+            try:
+                a_decision, _, a_response = await agent_a.evaluate_offer(
+                    round_num=round_num,
+                    opponent_offer=b_counter,
+                    scenario_rules=rules,
+                    offer_history=offer_history,
+                    opponent_name=config.get("agent_b_name", "Party B"),
                 )
 
-            if a_decision == "accept":
-                if not self._valid_final_offer(rules, b_counter):
-                    await self._stop_for_validation_error(
+                if (
+                    a_decision == "accept"
+                    and not rules.is_offer_acceptable("agent_a", b_counter)
+                ):
+                    a_decision = "counter"
+                    prefix = "[MOCK] " if isinstance(agent_a, MockAgent) else ""
+                    a_response = (
+                        f"{prefix}The offer is outside my acceptable limits. "
+                        "I cannot accept these terms."
+                    )
+
+                if a_decision == "accept":
+                    if not self._valid_final_offer(rules, b_counter):
+                        await self._stop_for_validation_error(
+                            neg,
+                            "Final offer violates the negotiation price limits.",
+                        )
+                        return
+
+                    await self._add_message(
+                        MessageRole.AGENT_A,
+                        a_response,
+                        round_num,
+                    )
+                    offer_record_b.status = OfferStatus.ACCEPTED
+                    await self._complete_negotiation(
                         neg,
-                        "Final offer violates the negotiation price limits.",
+                        rules,
+                        b_counter,
+                        offer_history,
                     )
                     return
 
-                await self._add_message(
-                    MessageRole.AGENT_A, a_response, round_num
-                )
-                offer_record_b.status = OfferStatus.ACCEPTED
-                await self._complete_negotiation(
-                    neg, rules, b_counter, offer_history
-                )
+            except (ValueError, TypeError, AttributeError, OverflowError) as exc:
+                await self._stop_for_validation_error(neg, str(exc))
                 return
 
             offer_record_b.status = OfferStatus.COUNTERED
             await self._add_message(
-                MessageRole.AGENT_A, a_response, round_num
+                MessageRole.AGENT_A,
+                a_response,
+                round_num,
             )
             await self.db.commit()
 
@@ -272,299 +275,11 @@ class NegotiationEngine:
                 return
 
         # Maximum rounds reached.
-        await self._deadlock_negotiation(neg)
-
-    def _valid_final_offer(self, rules, offer: dict) -> bool:
-        """Check the final offer against the scenario's hard limits."""
-        try:
-            if isinstance(rules, VendorPricingRules):
-                return rules.is_offer_acceptable("agent_a", offer)
-            return (
-                rules.is_offer_acceptable("agent_a", offer)
-                and rules.is_offer_acceptable("agent_b", offer)
-            )
-        except (TypeError, ValueError, AttributeError):
-            return False
-
-    async def process_human_offer(
-        self, offer_data: dict, message: Optional[str]
-    ) -> dict:
-        """Handle a human offer in Practice Mode and get the AI response."""
         neg = await self._load_negotiation()
-        if not neg:
-            return {
-                "decision": "error",
-                "message": "Negotiation not found.",
-            }
-
-        config = neg.config or {}
-
-        try:
-            rules = get_scenario_rules(neg.scenario_type, config)
-        except (ValueError, TypeError) as exc:
-            await self._stop_for_validation_error(neg, str(exc))
-            return {"decision": "error", "message": str(exc)}
-
-        # Reject invalid buyer prices instead of silently clamping them.
-        if isinstance(rules, VendorPricingRules):
-            try:
-                submitted_price = float(offer_data.get("price"))
-            except (TypeError, ValueError, AttributeError):
-                return {
-                    "decision": "error",
-                    "message": "Please enter a valid offer price.",
-                }
-
-            if not math.isfinite(submitted_price) or submitted_price <= 0:
-                return {
-                    "decision": "error",
-                    "message": "Offer price must be a positive number.",
-                }
-
-            if submitted_price > rules.buyer_max:
-                return {
-                    "decision": "error",
-                    "message": (
-                        f"Offer rejected. Buyer maximum price is "
-                        f"₹{rules.buyer_max:,.2f}."
-                    ),
-                }
-
-        try:
-            clamped = rules.clamp_offer("agent_a", offer_data)
-        except (ValueError, TypeError, AttributeError) as exc:
-            return {"decision": "error", "message": str(exc)}
-
-        offers_result = await self.db.execute(
-            select(Offer)
-            .where(Offer.negotiation_id == self.negotiation_id)
-            .order_by(Offer.created_at)
-        )
-        prior_offers = offers_result.scalars().all()
-
-        offer_history = [
-            {
-                "round": offer.round_number,
-                "by": offer.made_by,
-                "offer": offer.offer_data,
-            }
-            for offer in prior_offers
-        ]
-
-        for previous_offer in prior_offers:
-            if (
-                previous_offer.made_by == "agent_b"
-                and previous_offer.status == OfferStatus.PENDING
-            ):
-                previous_offer.status = OfferStatus.COUNTERED
-
-        round_num = neg.current_round + 1
-        neg.current_round = round_num
-
-        human_msg = message or "Human offer submitted."
-        await self._add_message(
-            MessageRole.HUMAN, human_msg, round_num
-        )
-        human_offer = await self._add_offer(
-            round_num, "human", clamped, human_msg
-        )
-        offer_history.append(
-            {"round": round_num, "by": "human", "offer": clamped}
-        )
-
-        agent_b = _get_agent(
-            config.get("agent_b_personality", "aggressive"), "agent_b"
-        )
-        decision, counter, b_message = await agent_b.evaluate_offer(
-            round_num=round_num,
-            opponent_offer=clamped,
-            scenario_rules=rules,
-            offer_history=offer_history,
-            opponent_name="You",
-        )
-
-        if (
-            decision == "accept"
-            and not rules.is_offer_acceptable("agent_b", clamped)
+        if neg and neg.status not in (
+            NegotiationStatus.PAUSED,
+            NegotiationStatus.CANCELLED,
+            NegotiationStatus.DEADLOCKED,
+            NegotiationStatus.COMPLETED,
         ):
-            decision = "counter"
-            counter = rules.clamp_offer("agent_b", clamped)
-            prefix = "[MOCK] " if isinstance(agent_b, MockAgent) else ""
-            b_message = (
-                f"{prefix}Your offer is outside my acceptable limits. "
-                "Here is my counter-offer."
-            )
-
-        if decision == "accept":
-            if not self._valid_final_offer(rules, clamped):
-                await self._stop_for_validation_error(
-                    neg,
-                    "Final offer violates the negotiation price limits.",
-                )
-                return {
-                    "decision": "error",
-                    "message": "Final offer violates the negotiation limits.",
-                }
-
-            await self._add_message(
-                MessageRole.AGENT_B, b_message, round_num
-            )
-            offer_record_b = await self._add_offer(
-                round_num, "agent_b", clamped, b_message
-            )
-            offer_record_b.status = OfferStatus.ACCEPTED
-            human_offer.status = OfferStatus.ACCEPTED
-
-            await self._complete_negotiation(
-                neg, rules, clamped, offer_history
-            )
-            return {
-                "decision": "accept",
-                "message": b_message,
-                "agreed_offer": clamped,
-            }
-
-        try:
-            counter = rules.clamp_offer("agent_b", counter or clamped)
-        except (ValueError, TypeError, AttributeError) as exc:
-            await self._stop_for_validation_error(neg, str(exc))
-            return {"decision": "error", "message": str(exc)}
-
-        human_offer.status = OfferStatus.COUNTERED
-        await self._add_message(
-            MessageRole.AGENT_B, b_message, round_num
-        )
-        await self._add_offer(round_num, "agent_b", counter, b_message)
-        offer_history.append(
-            {"round": round_num, "by": "agent_b", "offer": counter}
-        )
-        await self.db.commit()
-
-        if round_num >= neg.max_rounds:
             await self._deadlock_negotiation(neg)
-            return {
-                "decision": "deadlock",
-                "message": "Maximum rounds reached.",
-                "counter_offer": counter,
-            }
-
-        return {
-            "decision": decision,
-            "message": b_message,
-            "counter_offer": counter,
-        }
-
-    # ── Helpers ────────────────────────────────────────────────────────
-
-    async def _add_message(
-        self,
-        role: MessageRole,
-        content: str,
-        round_num: Optional[int] = None,
-    ):
-        msg = NegotiationMessage(
-            negotiation_id=self.negotiation_id,
-            role=role,
-            content=content,
-            round_number=round_num,
-        )
-        self.db.add(msg)
-        await self.db.flush()
-        return msg
-
-    async def _add_offer(
-        self,
-        round_num: int,
-        made_by: str,
-        offer_data: dict,
-        rationale: str,
-    ) -> Offer:
-        offer = Offer(
-            negotiation_id=self.negotiation_id,
-            round_number=round_num,
-            made_by=made_by,
-            offer_data=offer_data,
-            rationale=rationale,
-        )
-        self.db.add(offer)
-        await self.db.flush()
-        return offer
-
-    def _detect_deadlock(self, history: list) -> bool:
-        """Detect if the last four offers show no meaningful movement."""
-        if len(history) < 4:
-            return False
-
-        recent = history[-4:]
-        a_offers = [
-            item["offer"]
-            for item in recent
-            if item["by"] in ("agent_a", "human")
-        ]
-        b_offers = [
-            item["offer"]
-            for item in recent
-            if item["by"] == "agent_b"
-        ]
-
-        if len(a_offers) >= 2 and len(b_offers) >= 2:
-            a_stagnant = all(item == a_offers[0] for item in a_offers)
-            b_stagnant = all(item == b_offers[0] for item in b_offers)
-            return a_stagnant and b_stagnant
-
-        return False
-
-    async def _complete_negotiation(
-        self, neg: Negotiation, rules, agreed_offer: dict, history: list
-    ):
-        # Final guard: never mark an invalid offer as an agreement.
-        if not self._valid_final_offer(rules, agreed_offer):
-            await self._stop_for_validation_error(
-                neg,
-                "Final offer violates the negotiation limits.",
-            )
-            return
-
-        satisfaction = rules.compute_satisfaction(agreed_offer)
-        neg.status = NegotiationStatus.COMPLETED
-        neg.completed_at = datetime.now(timezone.utc)
-        neg.outcome_data = {
-            "final_outcome": "Agreement reached",
-            "agreed_terms": agreed_offer,
-            "initial_offer": history[0]["offer"] if history else {},
-            "final_offer": agreed_offer,
-            "satisfaction_scores": satisfaction,
-        }
-
-        await self.db.flush()
-        await self._add_message(
-            MessageRole.SYSTEM,
-            "Agreement reached! Negotiation completed successfully.",
-        )
-        await self.db.commit()
-        logger.info(
-            "Negotiation %s completed with agreement.",
-            self.negotiation_id,
-        )
-
-    async def _deadlock_negotiation(self, neg: Negotiation):
-        neg.status = NegotiationStatus.DEADLOCKED
-        neg.completed_at = datetime.now(timezone.utc)
-        neg.outcome_data = {
-            "final_outcome": "Deadlock — no agreement reached",
-            "breakdown_reason": (
-                "Parties could not reach agreement within the maximum "
-                "number of rounds."
-            ),
-        }
-
-        await self.db.flush()
-        await self._add_message(
-            MessageRole.SYSTEM,
-            "Negotiation ended in deadlock. No agreement was reached.",
-        )
-        await self.db.commit()
-        logger.info(
-            "Negotiation %s ended in deadlock.",
-            self.negotiation_id,
-        )
