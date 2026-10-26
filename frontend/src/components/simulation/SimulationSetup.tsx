@@ -1,4 +1,3 @@
-  // Validate all fields before creating a negotiation
   const validate = (): boolean => {
     setValidationError(null);
 
@@ -22,7 +21,6 @@
       return fail('Maximum negotiation rounds must be between 3 and 30.');
     }
 
-    // VENDOR PRICING VALIDATION
     if (scenarioType === 'vendor_pricing') {
       const values = [
         startingPrice,
@@ -45,7 +43,6 @@
         );
       }
 
-      // Critical fix: STOP when no ZOPA exists.
       if (vendorMinPrice > buyerMaxPrice) {
         return fail(
           `Negotiation cannot start: Vendor Minimum Price (₹${vendorMinPrice.toLocaleString('en-IN')}) exceeds Buyer Maximum Price (₹${buyerMaxPrice.toLocaleString('en-IN')}). Please correct these values.`
@@ -71,7 +68,6 @@
       }
     }
 
-    // JOB OFFER VALIDATION
     if (scenarioType === 'job_offer') {
       const values = [
         startingSalary,
@@ -174,7 +170,6 @@
 
       const newId = createRes.data.id;
 
-      // Only navigate after the start request succeeds.
       await negotiationsApi.start(newId);
 
       toast.success('Negotiation started successfully.');
